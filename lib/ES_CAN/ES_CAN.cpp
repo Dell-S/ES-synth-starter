@@ -1,3 +1,4 @@
+#include "stm32l4xx_hal.h"  // This must come before any other HAL headers
 #include <stm32l4xx_hal_can.h>
 #include <stm32l4xx_hal_rcc.h>
 #include <stm32l4xx_hal_gpio.h>
