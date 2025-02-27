@@ -4,7 +4,7 @@
 #include <STM32FreeRTOS.h>
 #include <HardwareTimer.h>
 #include <ES_CAN.h>
-#include <string.h>  // for memcpy()
+#include <string.h>  // for memcpy() and string functions
 
 //------------------------
 // Module configuration:
@@ -18,7 +18,7 @@
 // #define DISABLE_THREADS
 
 // Uncomment to test execution time of scanKeysTask (the test version runs 32 iterations)
- // #define TEST_SCANKEYS
+// #define TEST_SCANKEYS
 
 // Pin definitions
 const int RA0_PIN = D3;
@@ -35,18 +35,29 @@ const int OUT_PIN = D11;
 const int OUTL_PIN = A4;
 const int OUTR_PIN = A3;
 
-const int JOYY_PIN = A0;
-const int JOYX_PIN = A1;
+// The original joystick pins are still defined but not used for waveform selection now.
+const int JOYY_PIN = A0; // used for octave change
+const int JOYX_PIN = A1; // no longer used
 
 const int DEN_BIT  = 3;
 const int DRST_BIT = 4;
 const int HKOW_BIT = 5;
 const int HKOE_BIT = 6;
 
+//------------------------
+// Waveform selection support
+enum WaveformType {
+  SAWTOOTH = 0,
+  SQUARE,
+  TRIANGLE,
+  SINE
+};
+volatile uint8_t waveformType = SAWTOOTH; // Default waveform
+
 // Global structure for system state with mutex, knob rotation, and current octave.
 struct SystemState {
   std::bitset<32> inputs;
-  int knob3Rotation;      // Knob 3 rotation (volume control, limited 0-8)
+  int knob3Rotation;      // Knob 3 rotation (volume control, 0-8)
   uint8_t currentOctave;   // Current octave (0 to 8)
   SemaphoreHandle_t mutex;
 } sysState;
@@ -67,18 +78,49 @@ const uint32_t stepSizes[12] = {
   96468917   // B
 };
 
+//----------------------------------------------------------------
+// Polyphony support: define maximum voices and a Voice structure.
+#define MAX_VOICES 4
+
+struct Voice {
+  bool active;
+  uint32_t phaseAcc;
+  uint32_t stepSize;
+  uint8_t key; // note number (0-11)
+};
+
+volatile Voice voices[MAX_VOICES] = {0};  // Global array of voices
+
+//----------------------------------------------------------------
+// Sine lookup table (256 values) computed as 128+127*sin(2*pi*i/256)
+static const uint8_t sineTable[256] = {
+  128,131,134,137,140,143,146,149,152,155,158,161,163,166,169,171,
+  174,177,179,182,184,186,189,191,193,195,197,199,201,203,205,206,
+  208,210,211,213,214,215,217,218,219,220,221,222,223,224,224,225,
+  226,226,227,227,228,228,228,229,229,229,229,230,230,230,230,230,
+  230,230,230,230,230,230,229,229,229,229,228,228,228,227,227,226,
+  226,225,224,224,223,222,221,220,219,218,217,215,214,213,211,210,
+  208,206,205,203,201,199,197,195,193,191,189,186,184,182,179,177,
+  174,171,169,166,163,161,158,155,152,149,146,143,140,137,134,131,
+  128,124,121,118,115,112,109,106,103,100, 97, 94, 91, 88, 86, 83,
+   81, 78, 76, 74, 71, 69, 67, 65, 63, 61, 59, 57, 55, 53, 51, 50,
+   48, 46, 45, 43, 42, 40, 39, 38, 36, 35, 34, 33, 32, 31, 30, 29,
+   28, 27, 26, 25, 24,24, 23, 22, 22, 21, 21, 20, 20, 19, 19, 19,
+   18, 18, 18, 17, 17, 17, 16, 16, 16, 15, 15, 15, 14, 14, 14, 13,
+   13, 13, 12, 12, 12, 11, 11, 11, 10, 10, 10,  9,  9,  9,  8,  8,
+    8,  7,  7,  7,  6,  6,  6,  5,  5,  5,  4,  4,  4,  3,  3,  3,
+    2,  2,  2,  1,  1,  1,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0
+};
+
+//----------------------------------------------------------------
 // Hardware timer used for generating sound at a sample rate of 22kHz.
 HardwareTimer sampleTimer(TIM1);
-
-// Global variables used for sound generation and note display
-volatile uint32_t currentStepSize = 0;
-volatile int currentNoteIndex = -1;  // -1 indicates no key is pressed
 
 // CAN bus globals
 QueueHandle_t msgInQ;
 QueueHandle_t msgOutQ;
 SemaphoreHandle_t CAN_TX_Semaphore;
-volatile uint8_t RX_Message[8] = {0};  // Global variable to hold the received CAN message
+volatile uint8_t RX_Message[8] = {0};  // Holds received CAN message
 
 // Display driver object
 U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
@@ -97,11 +139,11 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value) {
 }
 
 void setRow(uint8_t rowIdx) {
-  digitalWrite(REN_PIN, LOW);  // Disable REN while updating address pins
+  digitalWrite(REN_PIN, LOW);
   digitalWrite(RA0_PIN, (rowIdx & 0x01) ? HIGH : LOW);
   digitalWrite(RA1_PIN, (rowIdx & 0x02) ? HIGH : LOW);
   digitalWrite(RA2_PIN, (rowIdx & 0x04) ? HIGH : LOW);
-  digitalWrite(REN_PIN, HIGH); // Re-enable REN
+  digitalWrite(REN_PIN, HIGH);
 }
 
 std::bitset<4> readCols() {
@@ -114,136 +156,221 @@ std::bitset<4> readCols() {
 }
 
 //------------------------------------------------
-// ISR for sound generation (22kHz sample rate)
-void sampleISR() {
-  static uint32_t phaseAcc = 0;
-  phaseAcc += currentStepSize;
-  int32_t Vout = (phaseAcc >> 24) - 128;
-  // Volume control via knob3Rotation (log taper)
-  int knob = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
-  Vout = Vout >> (8 - knob);
-  analogWrite(OUTR_PIN, Vout + 128);
+// Polyphony helper functions.
+void allocateVoice(uint8_t key, uint32_t baseStep) {
+  uint8_t octave;
+  xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+  octave = sysState.currentOctave;
+  xSemaphoreGive(sysState.mutex);
+  
+  uint32_t newStep;
+  if (octave >= 4)
+    newStep = baseStep << (octave - 4);
+  else
+    newStep = baseStep >> (4 - octave);
+  
+  noInterrupts();
+  for (int i = 0; i < MAX_VOICES; i++) {
+    if (!voices[i].active) {
+      voices[i].active = true;
+      voices[i].phaseAcc = 0;
+      voices[i].stepSize = newStep;
+      voices[i].key = key;
+      break;
+    }
+  }
+  interrupts();
+}
+
+void freeVoice(uint8_t key) {
+  noInterrupts();
+  for (int i = 0; i < MAX_VOICES; i++) {
+    if (voices[i].active && voices[i].key == key) {
+      voices[i].active = false;
+      break;
+    }
+  }
+  interrupts();
+}
+
+void allocateVoiceCAN(uint8_t note, uint8_t octave, uint32_t baseStep) {
+  uint32_t newStep;
+  if (octave >= 4)
+    newStep = baseStep << (octave - 4);
+  else
+    newStep = baseStep >> (4 - octave);
+  
+  noInterrupts();
+  for (int i = 0; i < MAX_VOICES; i++) {
+    if (!voices[i].active) {
+      voices[i].active = true;
+      voices[i].phaseAcc = 0;
+      voices[i].stepSize = newStep;
+      voices[i].key = note;
+      break;
+    }
+  }
+  interrupts();
 }
 
 //------------------------------------------------
-// scanKeysTask: scans key matrix, decodes knob3, processes joystick for octave changes,
-// and (in sender mode) sends CAN messages. Runs every 20ms.
+// ISR for sound generation (22kHz sample rate) with waveform selection.
+void sampleISR() {
+  int32_t mixedOutput = 0;
+  int activeCount = 0;
+  for (int i = 0; i < MAX_VOICES; i++) {
+    if (voices[i].active) {
+      voices[i].phaseAcc += voices[i].stepSize;
+      int32_t voiceOutput = 0;
+      switch(waveformType) {
+        case SAWTOOTH:
+          voiceOutput = ((voices[i].phaseAcc >> 24) - 128);
+          break;
+        case SQUARE:
+          voiceOutput = (voices[i].phaseAcc & 0x80000000UL) ? 127 : -128;
+          break;
+        case TRIANGLE:
+          if (voices[i].phaseAcc < 0x80000000UL)
+            voiceOutput = ((voices[i].phaseAcc >> 23) - 128);
+          else
+            voiceOutput = (127 - ((voices[i].phaseAcc - 0x80000000UL) >> 23));
+          break;
+        case SINE:
+          voiceOutput = ((int)sineTable[voices[i].phaseAcc >> 24]) - 128;
+          break;
+        default:
+          voiceOutput = ((voices[i].phaseAcc >> 24) - 128);
+      }
+      mixedOutput += voiceOutput;
+      activeCount++;
+    }
+  }
+  if (activeCount > 0)
+    mixedOutput /= activeCount;
+  
+  int knob = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
+  mixedOutput = mixedOutput >> (8 - knob);
+  analogWrite(OUTR_PIN, mixedOutput + 128);
+}
+
+//------------------------------------------------
+// scanKeysTask: scans key matrix, decodes knob3 (volume), decodes knob1 (waveform),
+// processes joystick for octave changes, and (in sender mode) sends CAN messages.
+// Runs every 20ms.
 #ifndef TEST_SCANKEYS
 void scanKeysTask(void * pvParameters) {
   const TickType_t xFrequency = 20 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
   
-  // For knob3 decode: store previous {B,A} state (2 bits)
-  static uint8_t prevKnobState = 0;
-  // For CAN message generation: keep a copy of previous state for keys 0-11.
+  static uint8_t prevKnobState = 0;    // For knob3 (volume)
+  static uint8_t prevKnob1State = 0;     // For knob1 (waveform)
   static std::bitset<32> prevInputs;
-  
-  // For joystick octave change – used to ensure only one change per extreme push.
   static bool octaveChanged = false;
   
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
     std::bitset<32> inputs;
-    uint32_t localStepSize = 0;
-    int localNoteIndex = -1; // -1 indicates no key pressed
-
-    // Loop through rows 0 to 3 (rows 0-2: note keys; row 3: knob3)
-    for (uint8_t row = 0; row < 4; row++) {
+    
+    // Process rows 0 to 2 for note keys.
+    for (uint8_t row = 0; row < 3; row++) {
       setRow(row);
-      delayMicroseconds(3); // Allow time for the row to settle
+      delayMicroseconds(3);
       std::bitset<4> cols = readCols();
-      
-      if (row < 3) {
-        // Process keys for note generation (only first 12 keys)
-        for (uint8_t col = 0; col < 4; col++) {
-          inputs[row * 4 + col] = cols[col];
-          if ((row * 4 + col) < 12) {
-            if (!cols[col]) { // key pressed (active low)
-              localStepSize = stepSizes[row * 4 + col];
-              localNoteIndex = row * 4 + col;
-            }
-          }
-        }
-      } else {
-        // Row 3: decode knob3 (using columns 0 and 1 for signals A and B)
-        uint8_t currKnobState = ((cols[1] ? 1 : 0) << 1) | (cols[0] ? 1 : 0);
-        int delta = 0;
-        // Decode state transitions
-        if (prevKnobState == 0x0 && currKnobState == 0x1) {
-          delta = 1;
-        } else if (prevKnobState == 0x1 && currKnobState == 0x0) {
-          delta = -1;
-        } else if (prevKnobState == 0x2 && currKnobState == 0x3) {
-          delta = -1;
-        } else if (prevKnobState == 0x3 && currKnobState == 0x2) {
-          delta = 1;
-        }
-        // Update knob3Rotation with limits 0 to 8 (protected by mutex)
-        xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-        sysState.knob3Rotation += delta;
-        if (sysState.knob3Rotation > 8) sysState.knob3Rotation = 8;
-        if (sysState.knob3Rotation < 0) sysState.knob3Rotation = 0;
-        xSemaphoreGive(sysState.mutex);
-        prevKnobState = currKnobState;
-        // Optionally store knob inputs in bits 12 and 13 (for debugging)
-        inputs[12] = cols[0];
-        inputs[13] = cols[1];
+      for (uint8_t col = 0; col < 4; col++) {
+        uint8_t keyIndex = row * 4 + col;
+        inputs[keyIndex] = cols[col];
       }
     }
     
-    // Update the global key state with mutex protection.
+    // Process row 3 for knob3 (volume) decoding.
+    setRow(3);
+    delayMicroseconds(3);
+    {
+      std::bitset<4> cols = readCols();
+      uint8_t currKnobState = ((cols[1] ? 1 : 0) << 1) | (cols[0] ? 1 : 0);
+      int delta = 0;
+      if (prevKnobState == 0x0 && currKnobState == 0x1)
+        delta = 1;
+      else if (prevKnobState == 0x1 && currKnobState == 0x0)
+        delta = -1;
+      else if (prevKnobState == 0x2 && currKnobState == 0x3)
+        delta = -1;
+      else if (prevKnobState == 0x3 && currKnobState == 0x2)
+        delta = 1;
+      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+      sysState.knob3Rotation += delta;
+      if (sysState.knob3Rotation > 8) sysState.knob3Rotation = 8;
+      if (sysState.knob3Rotation < 0) sysState.knob3Rotation = 0;
+      xSemaphoreGive(sysState.mutex);
+      prevKnobState = currKnobState;
+    }
+    
+    // Process row 4 for knob1 (waveform selection) decoding.
+    {
+      setRow(4);
+      delayMicroseconds(3);
+      std::bitset<4> knob1Cols = readCols();
+      uint8_t currKnob1State = ((knob1Cols[1] ? 1 : 0) << 1) | (knob1Cols[0] ? 1 : 0);
+      int delta1 = 0;
+      if (prevKnob1State == 0x0 && currKnob1State == 0x1)
+        delta1 = 1;
+      else if (prevKnob1State == 0x1 && currKnob1State == 0x0)
+        delta1 = -1;
+      else if (prevKnob1State == 0x2 && currKnob1State == 0x3)
+        delta1 = -1;
+      else if (prevKnob1State == 0x3 && currKnob1State == 0x2)
+        delta1 = 1;
+      // Update waveformType cyclically between 0 and 3.
+      int newWave = waveformType + delta1;
+      if(newWave < 0) newWave = 3;
+      if(newWave > 3) newWave = 0;
+      waveformType = newWave;
+      prevKnob1State = currKnob1State;
+    }
+    
+    // Update global key state.
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     sysState.inputs = inputs;
     xSemaphoreGive(sysState.mutex);
     
-    // Update the sound generation variables (only in RECEIVER_MODE)
-    #ifdef RECEIVER_MODE
-      if (localNoteIndex >= 0) {
-        uint8_t octave;
-        xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-        octave = sysState.currentOctave;
-        xSemaphoreGive(sysState.mutex);
-        uint32_t newStepSize;
-        if (octave >= 4)
-          newStepSize = localStepSize << (octave - 4);
-        else
-          newStepSize = localStepSize >> (4 - octave);
-        __atomic_store_n(&currentStepSize, newStepSize, __ATOMIC_RELAXED);
-        __atomic_store_n(&currentNoteIndex, localNoteIndex, __ATOMIC_RELAXED);
-      } else {
-        __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&currentNoteIndex, localNoteIndex, __ATOMIC_RELAXED);
-      }
-    #else
-      __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
-      __atomic_store_n(&currentNoteIndex, localNoteIndex, __ATOMIC_RELAXED);
-    #endif
-
-
-    // In SENDER_MODE, compare current keys with previous state and generate a CAN message for each change.
-    #ifdef SENDER_MODE
-      for (int key = 0; key < 12; key++) {
-        bool currentPressed = !inputs.test(key); // active low: false means pressed
-        bool prevPressed = !prevInputs.test(key);
-        if (currentPressed != prevPressed) {
-          uint8_t TX_Message[8] = {0};
-          TX_Message[0] = currentPressed ? 'P' : 'R';
-          uint8_t currentOctave;
-          xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-          currentOctave = sysState.currentOctave;
-          xSemaphoreGive(sysState.mutex);
-          TX_Message[1] = currentOctave;    // use current octave
-          TX_Message[2] = key;              // note number
-          xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
+    // For keys 0-11, detect changes to allocate or free voices.
+    for (int key = 0; key < 12; key++) {
+      bool currentPressed = !inputs.test(key);  // active low: false means pressed
+      bool prevPressed = !prevInputs.test(key);
+      if (currentPressed != prevPressed) {
+        if (currentPressed) {
+          allocateVoice(key, stepSizes[key]);
+          #ifdef SENDER_MODE
+            uint8_t TX_Message[8] = {0};
+            TX_Message[0] = 'P';
+            uint8_t currentOctave;
+            xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+            currentOctave = sysState.currentOctave;
+            xSemaphoreGive(sysState.mutex);
+            TX_Message[1] = currentOctave;
+            TX_Message[2] = key;
+            xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
+          #endif
+        } else {
+          freeVoice(key);
+          #ifdef SENDER_MODE
+            uint8_t TX_Message[8] = {0};
+            TX_Message[0] = 'R';
+            uint8_t currentOctave;
+            xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+            currentOctave = sysState.currentOctave;
+            xSemaphoreGive(sysState.mutex);
+            TX_Message[1] = currentOctave;
+            TX_Message[2] = key;
+            xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
+          #endif
         }
       }
-      prevInputs = inputs;
-    #endif
-
-    // --- Joystick-based Octave Change ---
-    // Read the analog value from the joystick Y-axis.
+    }
+    prevInputs = inputs;
+    
+    // --- Joystick-based Octave Change (vertical axis: JOYY) ---
     int joyVal = analogRead(JOYY_PIN);
-    // Use thresholds (example: <400 to increment, >600 to decrement)
     if (!octaveChanged) {
       if (joyVal < 400) {
         xSemaphoreTake(sysState.mutex, portMAX_DELAY);
@@ -257,7 +384,6 @@ void scanKeysTask(void * pvParameters) {
         octaveChanged = true;
       }
     } else {
-      // Only allow another change once the joystick returns to center.
       if (joyVal >= 400 && joyVal <= 600) {
         octaveChanged = false;
       }
@@ -265,82 +391,129 @@ void scanKeysTask(void * pvParameters) {
   }
 }
 #else
-// Test version of scanKeysTask: runs one iteration and generates a key press for each of the 12 keys.
 void scanKeysTaskTest() {
   for (int key = 0; key < 12; key++) {
-    uint8_t TX_Message[8] = {0};
-    TX_Message[0] = 'P';
-    TX_Message[1] = 4; // Not used in test
-    TX_Message[2] = key;
     #ifdef SENDER_MODE
-    xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
+      uint8_t TX_Message[8] = {0};
+      TX_Message[0] = 'P';
+      TX_Message[1] = 4;
+      TX_Message[2] = key;
+      xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
     #endif
   }
 }
 #endif
 
 //------------------------------------------------
-// displayUpdateTask: updates the OLED display with an aesthetic layout.
+// displayUpdateTask: updated display layout including waveform info.
+// Helper functions to draw icons using simple lines/shapes.
+// These can be adjusted or replaced with custom bitmaps as desired.
+void drawSawIcon(int x, int y) {
+  // Draw a simple zigzag (sawtooth wave) icon within an 8x8 box.
+  u8g2.drawLine(x, y + 8, x + 4, y);
+  u8g2.drawLine(x + 4, y, x + 8, y + 8);
+}
+
+void drawSquareIcon(int x, int y) {
+  // Draw a square wave icon: a rectangle with a filled half.
+  u8g2.drawFrame(x, y, 8, 8);
+  u8g2.drawBox(x, y, 4, 8);
+}
+
+void drawTriangleIcon(int x, int y) {
+  // Draw a triangle wave icon: an isosceles triangle within 8x8.
+  u8g2.drawTriangle(x, y + 8, x + 4, y, x + 8, y + 8);
+}
+
+void drawSineIcon(int x, int y) {
+  // Draw an approximate sine wave using a few line segments.
+  u8g2.drawLine(x, y + 4, x + 2, y + 2);
+  u8g2.drawLine(x + 2, y + 2, x + 4, y + 4);
+  u8g2.drawLine(x + 4, y + 4, x + 6, y + 6);
+  u8g2.drawLine(x + 6, y + 6, x + 8, y + 4);
+}
+
+void drawSpeakerIcon(int x, int y) {
+  // Draw a simple speaker icon: a triangle (speaker) with a small rectangle (driver)
+  u8g2.drawTriangle(x, y + 4, x + 4, y, x + 4, y + 8);
+  u8g2.drawBox(x + 5, y + 2, 2, 4);
+}
+
+// Modified display update task with enhanced layout and icons.
 void displayUpdateTask(void * pvParameters) {
   const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  // Names for note display remain the same.
+  const char* noteNames[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
   
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
     u8g2.clearBuffer();
     
-    // Get shared state with mutex protection.
     int knobVal;
-    unsigned long inputVal;
     uint8_t octave;
+    // Retrieve shared state.
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     knobVal = sysState.knob3Rotation;
-    inputVal = sysState.inputs.to_ulong();
     octave = sysState.currentOctave;
     xSemaphoreGive(sysState.mutex);
     
-    // ----- Title -----
+    // ----- Top Row: Title and Waveform Icon -----
     u8g2.setFont(u8g2_font_helvB08_tr);
-    const char* title = "Synthesizer";
-    int titleWidth = u8g2.getStrWidth(title);
-    u8g2.drawStr((128 - titleWidth) / 2, 8, title);
+    // Draw title on the left.
+    u8g2.drawStr(0, 10, "Keyboard Synth");
     
-    // ----- Volume Bar -----
-    u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(2, 16, "Vol:");
-    // Draw volume bar: a framed rectangle with fill proportional to knobVal (0–8).
-    const int barX = 40;
-    const int barY = 10;
-    const int barW = 70;
-    const int barH = 6;
+    // Draw waveform icon on the top right.
+    int iconX = 110;  // Adjust x position as needed.
+    int iconY = 2;    // Adjust y position as needed.
+    switch (waveformType) {
+      case SAWTOOTH:
+        drawSawIcon(iconX, iconY);
+        break;
+      case SQUARE:
+        drawSquareIcon(iconX, iconY);
+        break;
+      case TRIANGLE:
+        drawTriangleIcon(iconX, iconY);
+        break;
+      case SINE:
+        drawSineIcon(iconX, iconY);
+        break;
+      default:
+        drawSawIcon(iconX, iconY);
+    }
+    
+    // ----- Middle Row: Volume Bar with Speaker Icon -----
+    // Draw a speaker icon.
+    drawSpeakerIcon(0, 12);
+    // Draw a volume bar next to the speaker icon.
+    const int barX = 20;
+    const int barY = 16;
+    const int barW = 80;
+    const int barH = 4;
     u8g2.drawFrame(barX, barY, barW, barH);
-    int fillWidth = (knobVal * barW) / 8;
+    int fillWidth = (knobVal * barW) / 8;  // knob3Rotation is 0 to 8.
     u8g2.drawBox(barX, barY, fillWidth, barH);
     
-    // ----- Octave and Key Matrix -----
-    char octStr[10];
-    sprintf(octStr, "Oct:%d", octave);
-    u8g2.drawStr(2, 28, octStr);
-    
-    char hexBuffer[9];
-    sprintf(hexBuffer, "%08lX", inputVal);
-    u8g2.drawStr(60, 28, hexBuffer);
-    
-    // ----- Note or TX Indicator -----
-    #ifdef RECEIVER_MODE
-      const char* noteNames[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
-      int noteIndex = __atomic_load_n(&currentNoteIndex, __ATOMIC_RELAXED);
-      if (noteIndex >= 0 && noteIndex < 12) {
-        u8g2.drawStr(60, 16, noteNames[noteIndex]);
+    // ----- Bottom Row: Active Notes and Octave Info -----
+    char notesBuffer[32];
+    memset(notesBuffer, 0, sizeof(notesBuffer));
+    sprintf(notesBuffer, "Oct:%d ", octave);
+    for (int i = 0; i < MAX_VOICES; i++) {
+      if (voices[i].active) {
+        strcat(notesBuffer, noteNames[voices[i].key]);
+        strcat(notesBuffer, " ");
       }
-    #else
-      u8g2.drawStr(60, 16, "TX");
-    #endif
+    }
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 30, notesBuffer);
     
     u8g2.sendBuffer();
     digitalToggle(LED_BUILTIN);
   }
 }
+
 
 //------------------------------------------------
 // decodeTask: processes received CAN messages (only in RECEIVER_MODE)
@@ -349,24 +522,16 @@ void decodeTask(void * pvParameters) {
   uint8_t localMsg[8];
   for (;;) {
     xQueueReceive(msgInQ, localMsg, portMAX_DELAY);
-    // Copy the message to the global RX_Message with mutex protection.
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     memcpy((void*)RX_Message, localMsg, 8);
     xSemaphoreGive(sysState.mutex);
     
-    // Process the message: play note on key press, stop on release.
     if (localMsg[0] == 'R') {
-      __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
+      freeVoice(localMsg[2]);
     } else if (localMsg[0] == 'P') {
       uint8_t note = localMsg[2];
       uint8_t octave = localMsg[1];
-      uint32_t step = stepSizes[note];
-      uint32_t newStep;
-      if (octave >= 4)
-        newStep = step << (octave - 4);
-      else
-        newStep = step >> (4 - octave);
-      __atomic_store_n(&currentStepSize, newStep, __ATOMIC_RELAXED);
+      allocateVoiceCAN(note, octave, stepSizes[note]);
     }
   }
 }
@@ -394,7 +559,7 @@ void CAN_RX_ISR(void) {
   xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
 }
 
-// CAN TX ISR: called when a mailbox becomes available (only in SENDER_MODE)
+// CAN TX ISR: (only in SENDER_MODE)
 #ifdef SENDER_MODE
 void CAN_TX_ISR(void) {
   xSemaphoreGiveFromISR(CAN_TX_Semaphore, NULL);
@@ -418,33 +583,28 @@ void setup() {
   pinMode(C1_PIN, INPUT);
   pinMode(C2_PIN, INPUT);
   pinMode(C3_PIN, INPUT);
-  pinMode(JOYX_PIN, INPUT);
   pinMode(JOYY_PIN, INPUT);
+  pinMode(JOYX_PIN, INPUT);
 
-  // Initialise display
   setOutMuxBit(DRST_BIT, LOW);
   delayMicroseconds(2);
   setOutMuxBit(DRST_BIT, HIGH);
   u8g2.begin();
   setOutMuxBit(DEN_BIT, HIGH);
 
-  // Initialise UART
   Serial.begin(9600);
   Serial.println("Hello World");
 
-  // Initialise hardware timer for sound generation at 22kHz (only in RECEIVER_MODE)
   #ifdef RECEIVER_MODE
     sampleTimer.setOverflow(22000, HERTZ_FORMAT);
     sampleTimer.attachInterrupt(sampleISR);
     sampleTimer.resume();
   #endif
 
-  // Create the mutex for sysState and initialise knob3Rotation and currentOctave.
   sysState.mutex = xSemaphoreCreateMutex();
-  sysState.knob3Rotation = 8;   // start with full volume
+  sysState.knob3Rotation = 8;   // full volume
   sysState.currentOctave = 4;     // default octave
 
-  // Initialise CAN bus.
   CAN_Init(true);
   setCANFilter(0x123, 0x7ff);
   msgInQ = xQueueCreate(36, 8);
@@ -457,15 +617,14 @@ void setup() {
   CAN_Start();
 
   #ifndef DISABLE_THREADS
-    // Create tasks
     TaskHandle_t scanKeysHandle = NULL;
     xTaskCreate(
-      scanKeysTask,    /* Task function */
-      "scanKeys",      /* Task name */
-      128,             /* Stack size in words */
-      NULL,            /* Parameter */
-      2,               /* Priority */
-      &scanKeysHandle  /* Task handle */
+      scanKeysTask,
+      "scanKeys",
+      128,
+      NULL,
+      2,
+      &scanKeysHandle
     );
     
     TaskHandle_t displayHandle = NULL;
@@ -502,11 +661,9 @@ void setup() {
       );
     #endif
     
-    // Start the FreeRTOS scheduler (this call does not return)
     vTaskStartScheduler();
   #endif
 
-  // Test execution time for scanKeysTask if enabled.
   #ifdef TEST_SCANKEYS
     uint32_t startTime = micros();
     for (int iter = 0; iter < 32; iter++) {
@@ -518,5 +675,5 @@ void setup() {
 }
 
 void loop() {
-  // Nothing to do here. The RTOS scheduler now manages all tasks.
+  // RTOS scheduler manages tasks.
 }
