@@ -7,12 +7,16 @@
 #include <string.h>  // for memcpy() and string functions
 
 //------------------------
+// Increase volume resolution by defining MAX_VOLUME.
+#define MAX_VOLUME 16
+
 // Module configuration:
 // Uncomment one of the following:
 // For a module that sends key messages but does not generate sound:
 //// #define SENDER_MODE
 // For a module that receives messages and generates sound from local keys and incoming messages:
 #define RECEIVER_MODE
+
 //------------------------
 // Uncomment to disable threads (for execution time testing)
 // #define DISABLE_THREADS
@@ -37,7 +41,7 @@ const int OUTR_PIN = A3;
 
 // The original joystick pins are still defined but not used for waveform selection now.
 const int JOYY_PIN = A0; // used for octave change
-const int JOYX_PIN = A1; // no longer used
+const int JOYX_PIN = A1; // not used
 
 const int DEN_BIT  = 3;
 const int DRST_BIT = 4;
@@ -57,7 +61,7 @@ volatile uint8_t waveformType = SAWTOOTH; // Default waveform
 // Global structure for system state with mutex, knob rotation, and current octave.
 struct SystemState {
   std::bitset<32> inputs;
-  int knob3Rotation;      // Knob 3 rotation (volume control, 0-8)
+  int knob3Rotation;      // Knob 3 rotation (volume control, 0 to MAX_VOLUME)
   uint8_t currentOctave;   // Current octave (0 to 8)
   SemaphoreHandle_t mutex;
 } sysState;
@@ -215,6 +219,7 @@ void allocateVoiceCAN(uint8_t note, uint8_t octave, uint32_t baseStep) {
 
 //------------------------------------------------
 // ISR for sound generation (22kHz sample rate) with waveform selection.
+// Here the volume scaling uses a float multiplier computed from the knob (0 to MAX_VOLUME).
 void sampleISR() {
   int32_t mixedOutput = 0;
   int activeCount = 0;
@@ -249,13 +254,16 @@ void sampleISR() {
     mixedOutput /= activeCount;
   
   int knob = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
-  mixedOutput = mixedOutput >> (8 - knob);
-  analogWrite(OUTR_PIN, mixedOutput + 128);
+  // Map knob (0 to MAX_VOLUME) to a volume factor between 0.1 and 1.0.
+  float volFactor = 0.1 + ((float)knob / (float)MAX_VOLUME) * 0.9;
+  int finalOutput = (int)(mixedOutput * volFactor);
+  
+  analogWrite(OUTR_PIN, finalOutput + 128);
 }
 
 //------------------------------------------------
 // scanKeysTask: scans key matrix, decodes knob3 (volume), decodes knob1 (waveform),
-// processes joystick for octave changes, and (in sender mode) sends CAN messages.
+// processes joystick for octave changes, and sends CAN messages (if SENDER_MODE).
 // Runs every 20ms.
 #ifndef TEST_SCANKEYS
 void scanKeysTask(void * pvParameters) {
@@ -283,9 +291,9 @@ void scanKeysTask(void * pvParameters) {
     }
     
     // Process row 3 for knob3 (volume) decoding.
-    setRow(3);
-    delayMicroseconds(3);
     {
+      setRow(3);
+      delayMicroseconds(3);
       std::bitset<4> cols = readCols();
       uint8_t currKnobState = ((cols[1] ? 1 : 0) << 1) | (cols[0] ? 1 : 0);
       int delta = 0;
@@ -299,7 +307,7 @@ void scanKeysTask(void * pvParameters) {
         delta = 1;
       xSemaphoreTake(sysState.mutex, portMAX_DELAY);
       sysState.knob3Rotation += delta;
-      if (sysState.knob3Rotation > 8) sysState.knob3Rotation = 8;
+      if (sysState.knob3Rotation > MAX_VOLUME) sysState.knob3Rotation = MAX_VOLUME;
       if (sysState.knob3Rotation < 0) sysState.knob3Rotation = 0;
       xSemaphoreGive(sysState.mutex);
       prevKnobState = currKnobState;
@@ -320,7 +328,6 @@ void scanKeysTask(void * pvParameters) {
         delta1 = -1;
       else if (prevKnob1State == 0x3 && currKnob1State == 0x2)
         delta1 = 1;
-      // Update waveformType cyclically between 0 and 3.
       int newWave = waveformType + delta1;
       if(newWave < 0) newWave = 3;
       if(newWave > 3) newWave = 0;
@@ -405,28 +412,22 @@ void scanKeysTaskTest() {
 #endif
 
 //------------------------------------------------
-// displayUpdateTask: updated display layout including waveform info.
-// Helper functions to draw icons using simple lines/shapes.
-// These can be adjusted or replaced with custom bitmaps as desired.
+// Helper functions for drawing icons on the display.
 void drawSawIcon(int x, int y) {
-  // Draw a simple zigzag (sawtooth wave) icon within an 8x8 box.
   u8g2.drawLine(x, y + 8, x + 4, y);
   u8g2.drawLine(x + 4, y, x + 8, y + 8);
 }
 
 void drawSquareIcon(int x, int y) {
-  // Draw a square wave icon: a rectangle with a filled half.
   u8g2.drawFrame(x, y, 8, 8);
   u8g2.drawBox(x, y, 4, 8);
 }
 
 void drawTriangleIcon(int x, int y) {
-  // Draw a triangle wave icon: an isosceles triangle within 8x8.
   u8g2.drawTriangle(x, y + 8, x + 4, y, x + 8, y + 8);
 }
 
 void drawSineIcon(int x, int y) {
-  // Draw an approximate sine wave using a few line segments.
   u8g2.drawLine(x, y + 4, x + 2, y + 2);
   u8g2.drawLine(x + 2, y + 2, x + 4, y + 4);
   u8g2.drawLine(x + 4, y + 4, x + 6, y + 6);
@@ -434,18 +435,18 @@ void drawSineIcon(int x, int y) {
 }
 
 void drawSpeakerIcon(int x, int y) {
-  // Draw a simple speaker icon: a triangle (speaker) with a small rectangle (driver)
   u8g2.drawTriangle(x, y + 4, x + 4, y, x + 4, y + 8);
   u8g2.drawBox(x + 5, y + 2, 2, 4);
 }
 
-// Modified display update task with enhanced layout and icons.
+//------------------------------------------------
+// displayUpdateTask: updated display layout including waveform info and icons.
 void displayUpdateTask(void * pvParameters) {
   const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
-
-  // Names for note display remain the same.
+  
   const char* noteNames[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+  const char* waveformNames[4] = {"Saw", "Square", "Tri", "Sine"};
   
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -453,20 +454,20 @@ void displayUpdateTask(void * pvParameters) {
     
     int knobVal;
     uint8_t octave;
-    // Retrieve shared state.
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     knobVal = sysState.knob3Rotation;
     octave = sysState.currentOctave;
     xSemaphoreGive(sysState.mutex);
     
-    // ----- Top Row: Title and Waveform Icon -----
+    // Line 1: Title with waveform info and icon.
     u8g2.setFont(u8g2_font_helvB08_tr);
-    // Draw title on the left.
-    u8g2.drawStr(0, 10, "Keyboard Synth");
+    char titleBuffer[32];
+    sprintf(titleBuffer, "Synth: %s", waveformNames[waveformType]);
+    int titleWidth = u8g2.getStrWidth(titleBuffer);
+    u8g2.drawStr((128 - titleWidth) / 2, 10, titleBuffer);
     
-    // Draw waveform icon on the top right.
-    int iconX = 110;  // Adjust x position as needed.
-    int iconY = 2;    // Adjust y position as needed.
+    int iconX = 110;
+    int iconY = 2;
     switch (waveformType) {
       case SAWTOOTH:
         drawSawIcon(iconX, iconY);
@@ -484,19 +485,17 @@ void displayUpdateTask(void * pvParameters) {
         drawSawIcon(iconX, iconY);
     }
     
-    // ----- Middle Row: Volume Bar with Speaker Icon -----
-    // Draw a speaker icon.
+    // Line 2: Volume bar with speaker icon.
     drawSpeakerIcon(0, 12);
-    // Draw a volume bar next to the speaker icon.
     const int barX = 20;
     const int barY = 16;
     const int barW = 80;
     const int barH = 4;
     u8g2.drawFrame(barX, barY, barW, barH);
-    int fillWidth = (knobVal * barW) / 8;  // knob3Rotation is 0 to 8.
+    int fillWidth = (knobVal * barW) / MAX_VOLUME;
     u8g2.drawBox(barX, barY, fillWidth, barH);
     
-    // ----- Bottom Row: Active Notes and Octave Info -----
+    // Line 3: Active notes and octave info.
     char notesBuffer[32];
     memset(notesBuffer, 0, sizeof(notesBuffer));
     sprintf(notesBuffer, "Oct:%d ", octave);
@@ -513,7 +512,6 @@ void displayUpdateTask(void * pvParameters) {
     digitalToggle(LED_BUILTIN);
   }
 }
-
 
 //------------------------------------------------
 // decodeTask: processes received CAN messages (only in RECEIVER_MODE)
@@ -569,7 +567,6 @@ void CAN_TX_ISR(void) {
 //------------------------------------------------
 // setup() function
 void setup() {
-  // Set pin directions
   pinMode(RA0_PIN, OUTPUT);
   pinMode(RA1_PIN, OUTPUT);
   pinMode(RA2_PIN, OUTPUT);
@@ -602,8 +599,8 @@ void setup() {
   #endif
 
   sysState.mutex = xSemaphoreCreateMutex();
-  sysState.knob3Rotation = 8;   // full volume
-  sysState.currentOctave = 4;     // default octave
+  sysState.knob3Rotation = MAX_VOLUME;   // Set full volume to MAX_VOLUME
+  sysState.currentOctave = 4;            // default octave
 
   CAN_Init(true);
   setCANFilter(0x123, 0x7ff);
