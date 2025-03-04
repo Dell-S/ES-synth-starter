@@ -84,7 +84,7 @@ const uint32_t stepSizes[12] = {
 
 //----------------------------------------------------------------
 // Polyphony support: define maximum voices and a Voice structure.
-#define MAX_VOICES 4
+#define MAX_VOICES 10
 
 struct Voice {
   bool active;
